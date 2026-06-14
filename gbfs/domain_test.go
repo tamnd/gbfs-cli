@@ -2,13 +2,10 @@ package gbfs
 
 import (
 	"testing"
-
-	"github.com/tamnd/any-cli/kit"
 )
 
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in gbfs_test.go.
+// These tests are offline: they exercise the URI driver's pure string functions.
+// The client's HTTP behaviour is covered in gbfs_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -24,53 +21,73 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in      string
+		wantTyp string
+		wantID  string
+		wantErr bool
+	}{
+		{"bkn", "system", "bkn", false},
+		{"divvy", "system", "divvy", false},
+		{"bay", "system", "bay", false},
+		{"capital", "system", "capital", false},
+		{"station-12345", "station", "12345", false},
+		{"unknown-thing", "", "", true},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("Classify(%q): expected error, got nil (type=%q id=%q)", tc.in, typ, id)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("Classify(%q): unexpected error: %v", tc.in, err)
+			continue
+		}
+		if typ != tc.wantTyp || id != tc.wantID {
+			t.Errorf("Classify(%q) = (%q, %q), want (%q, %q)",
+				tc.in, typ, id, tc.wantTyp, tc.wantID)
 		}
 	}
 }
 
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+	cases := []struct {
+		typ     string
+		id      string
+		wantURL string
+		wantErr bool
+	}{
+		{"system", "bkn", "https://www.citibikenyc.com", false},
+		{"system", "divvy", "https://www.divvybikes.com", false},
+		{"system", "bay", "https://www.baywheels.com", false},
+		{"system", "capital", "https://www.capitalbikeshare.com", false},
+		{"station", "12345", "https://" + Host + "/station/12345", false},
+		{"unknown", "x", "", true},
+	}
+	for _, tc := range cases {
+		got, err := Domain{}.Locate(tc.typ, tc.id)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("Locate(%q, %q): expected error, got %q", tc.typ, tc.id, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("Locate(%q, %q): unexpected error: %v", tc.typ, tc.id, err)
+			continue
+		}
+		if got != tc.wantURL {
+			t.Errorf("Locate(%q, %q) = %q, want %q", tc.typ, tc.id, got, tc.wantURL)
+		}
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
-func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
-	if err != nil {
-		t.Fatalf("Mint: %v", err)
-	}
-	if want := "gbfs://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
-	}
-
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("gbfs", "about")
-	if err != nil || got.String() != "gbfs://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want gbfs://page/about", got.String(), err)
+func TestLocateUnknown(t *testing.T) {
+	_, err := Domain{}.Locate("system", "nonexistent")
+	if err == nil {
+		t.Error("Locate system/nonexistent: expected error, got nil")
 	}
 }

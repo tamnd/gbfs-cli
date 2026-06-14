@@ -2,14 +2,13 @@ package gbfs
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes gbfs as a kit Domain: a driver that a multi-domain
+// domain.go exposes GBFS as a kit Domain: a driver that a multi-domain
 // host (ant) enables with a single blank import,
 //
 //	import _ "github.com/tamnd/gbfs-cli/gbfs"
@@ -19,12 +18,9 @@ import (
 // gbfs:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone gbfs binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the gbfs driver. It carries no state; the per-run client is
+// Domain is the GBFS driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
@@ -36,138 +32,157 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "gbfs",
-			Short:  "A command line for gbfs.",
-			Long: `A command line for gbfs.
+			Short:  "Query public bike share data via GBFS feeds.",
+			Long: `Query public bike share data via GBFS feeds.
 
-gbfs reads public gbfs data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+gbfs reads public GBFS (General Bikeshare Feed Specification) feeds over
+plain HTTPS, shapes station and system data into clean records, and prints
+output that pipes into the rest of your tools. No API key required.
+
+Supported systems: bkn (Citi Bike NYC), divvy (Chicago), bay (Bay Wheels),
+capital (Capital Bikeshare DC).`,
+			Site: "github.com/tamnd/gbfs-cli",
 			Repo: "https://github.com/tamnd/gbfs-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `gbfs page` and
-	// `ant get gbfs://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "stations",
+		Group:   "read",
+		List:    true,
+		Summary: "List bike share stations with availability",
+		URIType: "station",
+	}, listStations)
 
-	// List op: members of a page, the home of `gbfs links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// gbfs://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "info",
+		Group:   "read",
+		Single:  true,
+		Summary: "Show system information (name, URL, timezone)",
+		URIType: "system",
+	}, getInfo)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the GBFS client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	gcfg := DefaultConfig()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		gcfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		gcfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		gcfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		gcfg.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(gcfg), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type stationsInput struct {
+	System   string  `kit:"flag" help:"system ID (bkn, divvy, bay, capital)"`
+	MinBikes int     `kit:"flag" help:"minimum bikes available filter"`
+	Limit    int     `kit:"flag,inherit" help:"max results"`
+	Client   *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type infoInput struct {
+	System string  `kit:"flag" help:"system ID (bkn, divvy, bay, capital)"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func listStations(ctx context.Context, in stationsInput, emit func(Station) error) error {
+	system := in.System
+	if system == "" {
+		system = "bkn"
+	}
+	stations, err := in.Client.ListStations(ctx, system, in.MinBikes)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	n := 0
+	for _, s := range stations {
+		if in.Limit > 0 && n >= in.Limit {
+			break
+		}
+		if err := emit(s); err != nil {
 			return err
 		}
+		n++
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full gbfs.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized gbfs reference: %q", input)
+func getInfo(ctx context.Context, in infoInput, emit func(*SystemInfo) error) error {
+	system := in.System
+	if system == "" {
+		system = "bkn"
 	}
-	return "page", id, nil
+	info, err := in.Client.GetSystemInfo(ctx, system)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(info)
+}
+
+// --- Resolver ---
+
+// Classify turns any accepted input into the canonical (type, id).
+// Accepts "bkn", "divvy", "bay", "capital" as system IDs,
+// and "station-<id>" as station references.
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+	knownSystems := map[string]bool{"bkn": true, "divvy": true, "bay": true, "capital": true}
+	if knownSystems[input] {
+		return "system", input, nil
+	}
+	if strings.HasPrefix(input, "station-") {
+		return "station", strings.TrimPrefix(input, "station-"), nil
+	}
+	return "", "", errs.Usage("unrecognized gbfs reference: %q", input)
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "system":
+		urls := DefaultConfig().SystemURLs
+		if base, ok := urls[id]; ok {
+			// derive the web URL from system_information
+			switch id {
+			case "bkn":
+				return "https://www.citibikenyc.com", nil
+			case "divvy":
+				return "https://www.divvybikes.com", nil
+			case "bay":
+				return "https://www.baywheels.com", nil
+			case "capital":
+				return "https://www.capitalbikeshare.com", nil
+			default:
+				return base, nil
+			}
+		}
+		return "", errs.Usage("gbfs: unknown system %q", id)
+	case "station":
+		return "https://" + Host + "/station/" + id, nil
+	default:
 		return "", errs.Usage("gbfs has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
 func mapErr(err error) error {
 	return err
 }
